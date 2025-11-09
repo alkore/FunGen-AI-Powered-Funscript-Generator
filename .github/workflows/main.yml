@@ -1,0 +1,164 @@
+name: FunGen macOS Intel – self-contained .app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+  build-macos-intel:
+    runs-on: macos-15-intel
+
+    env:
+      BUILD_TYPE: Release
+      APP_NAME: FunGen
+      ENV_NAME: FunGen
+      MINICONDA_DIR: ${{ github.workspace }}/miniconda3
+      INSTALL_DIR: ${{ github.workspace }}/install_root
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show runner info
+        run: |
+          echo "uname -a: $(uname -a)"
+          echo "arch: $(uname -m)"
+          sysctl -n machdep.cpu.brand_string || true
+          sw_vers
+
+      - name: Install base tools (git, ffmpeg, 7zip)
+        run: |
+          brew update
+          brew install git ffmpeg p7zip
+
+      - name: Run project installer (install.sh) into workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$INSTALL_DIR"
+          # Le bootstrap installe Miniconda dans $HOME/miniconda3 par défaut ; on redirige vers le workspace pour empaqueter facilement
+          export HOME="${{ github.workspace }}"
+          chmod +x ./install.sh
+          # Pas d’arguments : l’install “universelle” télécharge install.py et fait tout le setup (Conda 3.11, deps, launchers…)
+          ./install.sh
+          echo "Installer done."
+          # Pointeurs utiles
+          echo "HOME=$HOME"
+          echo "MINICONDA: $HOME/miniconda3"
+          echo "Install root (project dir expected): $INSTALL_DIR"
+
+      - name: Locate project & conda environment
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="${{ github.workspace }}"
+          # L’installer clone le repo dans $PWD/FunGen (cf. fungen_universal_installer.py CONFIG)
+          if [ -d "${{ github.workspace }}/FunGen" ]; then
+            PROJ="${{ github.workspace }}/FunGen"
+          else
+            # fallback: cherche un dossier contenant main.py
+            PROJ="$(find "${{ github.workspace }}" -maxdepth 3 -type f -name main.py -print -quit | xargs -I{} dirname {} || true)"
+          fi
+          if [ -z "${PROJ:-}" ] || [ ! -f "$PROJ/main.py" ]; then
+            echo "❌ main.py introuvable"; exit 1
+          fi
+
+          # Conda env attendu: $HOME/miniconda3/envs/FunGen
+          ENV_PATH="${{ github.workspace }}/miniconda3/envs/${{ env.ENV_NAME }}"
+          if [ ! -x "$ENV_PATH/bin/python" ]; then
+            echo "❌ Python de l'env conda introuvable: $ENV_PATH/bin/python"; ls -la "$ENV_PATH" || true; exit 1
+          fi
+
+          echo "PROJ=$PROJ" >> $GITHUB_OUTPUT
+          echo "ENV_PATH=$ENV_PATH" >> $GITHUB_OUTPUT
+          "$ENV_PATH/bin/python" -V
+          "$ENV_PATH/bin/pip" -V
+
+      - name: Create .app bundle layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="${{ github.workspace }}/${{ env.APP_NAME }}.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+          # Info.plist minimal
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key> <string>FunGen</string>
+            <key>CFBundleDisplayName</key> <string>FunGen</string>
+            <key>CFBundleIdentifier</key> <string>com.yourorg.fungen</string>
+            <key>CFBundleExecutable</key> <string>FunGen</string>
+            <key>CFBundlePackageType</key> <string>APPL</string>
+            <key>CFBundleShortVersionString</key> <string>1.0</string>
+            <key>LSMinimumSystemVersion</key> <string>11.0</string>
+            <key>NSHighResolutionCapable</key> <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Embed Conda env + project + ffmpeg into the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$APP_PATH"
+          PROJ="${{ steps.locate.outputs.PROJ }}"
+          ENV_PATH="${{ steps.locate.outputs.ENV_PATH }}"
+
+          # 1) Env conda complet (x86_64)
+          rsync -a "$ENV_PATH/" "$APP/Contents/Resources/conda_env/"
+
+          # 2) Projet FunGen (sources)
+          rsync -a --exclude '.git' "$PROJ/" "$APP/Contents/Resources/FunGen/"
+
+          # 3) ffmpeg/ffprobe (Homebrew) → Resources/bin
+          mkdir -p "$APP/Contents/Resources/bin"
+          cp "$(brew --prefix)/bin/ffmpeg"  "$APP/Contents/Resources/bin/" || true
+          cp "$(brew --prefix)/bin/ffprobe" "$APP/Contents/Resources/bin/" || true
+          chmod +x "$APP/Contents/Resources/bin/"* || true
+
+          # 4) Lanceur (script) dans MacOS/
+          cat > "$APP/Contents/MacOS/FunGen" <<'LAUNCH'
+          #!/bin/bash
+          set -e
+          APPDIR="$(cd "$(dirname "$0")"/.. && pwd)"
+          CONDA="$APPDIR/Resources/conda_env"
+          PROJ="$APPDIR/Resources/FunGen"
+          export PATH="$CONDA/bin:$APPDIR/Resources/bin:$PATH"
+          export PYTHONHOME="$CONDA"
+          export PYTHONNOUSERSITE=1
+          # Permet de trouver les .dylib de l'env conda au runtime
+          export DYLD_FALLBACK_LIBRARY_PATH="$CONDA/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+          # Numpy/Scipy parfois : .dylibs embarqués
+          if [ -d "$CONDA/lib/python3.11/site-packages/numpy/.dylibs" ]; then
+            export DYLD_FALLBACK_LIBRARY_PATH="$CONDA/lib/python3.11/site-packages/numpy/.dylibs:$DYLD_FALLBACK_LIBRARY_PATH"
+          fi
+          exec "$CONDA/bin/python" "$PROJ/main.py" "$@"
+          LAUNCH
+          chmod +x "$APP/Contents/MacOS/FunGen"
+
+      - name: Smoke test (CLI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$APP_PATH/Contents/MacOS/FunGen" --help || true
+          # Vérifie la version Python et ffmpeg vus par l’app
+          "$APP_PATH/Contents/MacOS/FunGen" -c "import sys,subprocess,os;print(sys.version);subprocess.run(['ffmpeg','-version'])" || true
+
+      - name: Zip the app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "FunGen-macOS-Intel.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FunGen-macOS-Intel
+          path: FunGen-macOS-Intel.zip
+          retention-days: 14
