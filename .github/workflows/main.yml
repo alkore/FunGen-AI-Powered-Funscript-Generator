@@ -10,11 +10,10 @@ jobs:
     runs-on: macos-15-intel
 
     env:
-      BUILD_TYPE: Release
       APP_NAME: FunGen
       ENV_NAME: FunGen
+      # IMPORTANT : on place Miniconda dans le workspace pour pouvoir l’empaqueter
       MINICONDA_DIR: ${{ github.workspace }}/miniconda3
-      INSTALL_DIR: ${{ github.workspace }}/install_root
 
     steps:
       - name: Checkout (with submodules)
@@ -34,47 +33,62 @@ jobs:
           brew update
           brew install git ffmpeg p7zip
 
-      - name: Run project installer (install.sh) into workspace
+      # ⬇️ Pré-installe Miniconda x86_64 ici, non interactif.
+      - name: Preinstall Miniconda (x86_64) into workspace
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$INSTALL_DIR"
-          # Le bootstrap installe Miniconda dans $HOME/miniconda3 par défaut ; on redirige vers le workspace pour empaqueter facilement
-          export HOME="${{ github.workspace }}"
-          chmod +x ./install.sh
-          # Pas d’arguments : l’install “universelle” télécharge install.py et fait tout le setup (Conda 3.11, deps, launchers…)
-          ./install.sh
-          echo "Installer done."
-          # Pointeurs utiles
-          echo "HOME=$HOME"
-          echo "MINICONDA: $HOME/miniconda3"
-          echo "Install root (project dir expected): $INSTALL_DIR"
+          cd "${{ github.workspace }}"
+          URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
+          curl -fsSL "$URL" -o miniconda.sh
+          bash miniconda.sh -b -p "${{ env.MINICONDA_DIR }}"
+          rm -f miniconda.sh
+          echo "✅ Miniconda installed at ${{ env.MINICONDA_DIR }}"
+          ls -la "${{ env.MINICONDA_DIR }}/bin" | head -n 20
+          # Expose conda/python pour les steps suivants
+          echo "${{ env.MINICONDA_DIR }}/bin" >> $GITHUB_PATH
 
+      # ⬇️ Lance l’installateur du projet ; il détectera Miniconda déjà en place.
+      # On positionne HOME=workspace pour que le script pointe bien sur $HOME/miniconda3 (notre MINICONDA_DIR).
+      - name: Run project installer (install.sh) using preinstalled conda
+        shell: bash
+        env:
+          HOME: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          chmod +x ./install.sh
+          # --force au besoin pour forcer la (ré)détection, mais souvent pas nécessaire
+          ./install.sh || (echo "❌ install.sh failed"; exit 1)
+
+      # ⬇️ Localise le projet et l’env conda créés par l’installateur
       - name: Locate project & conda environment
         id: locate
         shell: bash
+        env:
+          HOME: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          export HOME="${{ github.workspace }}"
-          # L’installer clone le repo dans $PWD/FunGen (cf. fungen_universal_installer.py CONFIG)
+          # Le repo projet cloné par l'installer s'appelle en général FunGen ; fallback sur un main.py
+          PROJ=""
           if [ -d "${{ github.workspace }}/FunGen" ]; then
             PROJ="${{ github.workspace }}/FunGen"
           else
-            # fallback: cherche un dossier contenant main.py
             PROJ="$(find "${{ github.workspace }}" -maxdepth 3 -type f -name main.py -print -quit | xargs -I{} dirname {} || true)"
           fi
           if [ -z "${PROJ:-}" ] || [ ! -f "$PROJ/main.py" ]; then
             echo "❌ main.py introuvable"; exit 1
           fi
 
-          # Conda env attendu: $HOME/miniconda3/envs/FunGen
-          ENV_PATH="${{ github.workspace }}/miniconda3/envs/${{ env.ENV_NAME }}"
+          ENV_PATH="${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}"
           if [ ! -x "$ENV_PATH/bin/python" ]; then
-            echo "❌ Python de l'env conda introuvable: $ENV_PATH/bin/python"; ls -la "$ENV_PATH" || true; exit 1
+            echo "❌ Python de l'env conda introuvable: $ENV_PATH/bin/python"
+            ls -la "$ENV_PATH" || true
+            exit 1
           fi
 
           echo "PROJ=$PROJ" >> $GITHUB_OUTPUT
           echo "ENV_PATH=$ENV_PATH" >> $GITHUB_OUTPUT
+
           "$ENV_PATH/bin/python" -V
           "$ENV_PATH/bin/pip" -V
 
@@ -84,7 +98,6 @@ jobs:
           set -euo pipefail
           APP="${{ github.workspace }}/${{ env.APP_NAME }}.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
-          # Info.plist minimal
           cat > "$APP/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -101,7 +114,6 @@ jobs:
           </dict>
           </plist>
           PLIST
-
           echo "APP_PATH=$APP" >> "$GITHUB_ENV"
 
       - name: Embed Conda env + project + ffmpeg into the app
@@ -134,9 +146,7 @@ jobs:
           export PATH="$CONDA/bin:$APPDIR/Resources/bin:$PATH"
           export PYTHONHOME="$CONDA"
           export PYTHONNOUSERSITE=1
-          # Permet de trouver les .dylib de l'env conda au runtime
           export DYLD_FALLBACK_LIBRARY_PATH="$CONDA/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-          # Numpy/Scipy parfois : .dylibs embarqués
           if [ -d "$CONDA/lib/python3.11/site-packages/numpy/.dylibs" ]; then
             export DYLD_FALLBACK_LIBRARY_PATH="$CONDA/lib/python3.11/site-packages/numpy/.dylibs:$DYLD_FALLBACK_LIBRARY_PATH"
           fi
@@ -149,8 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           "$APP_PATH/Contents/MacOS/FunGen" --help || true
-          # Vérifie la version Python et ffmpeg vus par l’app
-          "$APP_PATH/Contents/MacOS/FunGen" -c "import sys,subprocess,os;print(sys.version);subprocess.run(['ffmpeg','-version'])" || true
+          "$APP_PATH/Contents/MacOS/FunGen" -c "import sys,subprocess;print(sys.version);subprocess.run(['ffmpeg','-version'])" || true
 
       - name: Zip the app
         run: |
