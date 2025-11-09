@@ -1,4 +1,4 @@
-name: FunGen macOS Intel – self-contained .app
+name: FunGen macOS Intel – self-contained .app (manual conda setup)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,6 @@ jobs:
     env:
       APP_NAME: FunGen
       ENV_NAME: FunGen
-      # IMPORTANT : on place Miniconda dans le workspace pour pouvoir l’empaqueter
       MINICONDA_DIR: ${{ github.workspace }}/miniconda3
 
     steps:
@@ -33,7 +32,7 @@ jobs:
           brew update
           brew install git ffmpeg p7zip
 
-      # ⬇️ Pré-installe Miniconda x86_64 ici, non interactif.
+      # 1) Miniconda x86_64
       - name: Preinstall Miniconda (x86_64) into workspace
         shell: bash
         run: |
@@ -43,55 +42,69 @@ jobs:
           curl -fsSL "$URL" -o miniconda.sh
           bash miniconda.sh -b -p "${{ env.MINICONDA_DIR }}"
           rm -f miniconda.sh
-          echo "✅ Miniconda installed at ${{ env.MINICONDA_DIR }}"
-          ls -la "${{ env.MINICONDA_DIR }}/bin" | head -n 20
-          # Expose conda/python pour les steps suivants
           echo "${{ env.MINICONDA_DIR }}/bin" >> $GITHUB_PATH
+          "${{ env.MINICONDA_DIR }}/bin/python" -V
 
-      # ⬇️ Lance l’installateur du projet ; il détectera Miniconda déjà en place.
-      # On positionne HOME=workspace pour que le script pointe bien sur $HOME/miniconda3 (notre MINICONDA_DIR).
-      - name: Run project installer (install.sh) using preinstalled conda
+      # 2) Créer l'env conda FunGen (Python 3.11)
+      - name: Create conda env (Python 3.11)
         shell: bash
-        env:
-          HOME: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          chmod +x ./install.sh
-          # --force au besoin pour forcer la (ré)détection, mais souvent pas nécessaire
-          ./install.sh || (echo "❌ install.sh failed"; exit 1)
+          "${{ env.MINICONDA_DIR }}/bin/conda" create -y -p "${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}" python=3.11
+          "${{ env.MINICONDA_DIR }}/bin/conda" run -p "${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}" python -V
 
-      # ⬇️ Localise le projet et l’env conda créés par l’installateur
-      - name: Locate project & conda environment
+      # 3) Installer les dépendances du repo (core.requirements.txt -> requirements.txt -> pyproject.toml)
+      - name: Install Python dependencies into env
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_PATH="${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}"
+          PIP="${ENV_PATH}/bin/pip"
+          PY="${ENV_PATH}/bin/python"
+
+          $PIP install --upgrade pip wheel setuptools
+
+          if [ -f "core.requirements.txt" ]; then
+            echo "Installing from core.requirements.txt"
+            $PIP install -r core.requirements.txt
+          elif [ -f "requirements.txt" ]; then
+            echo "Installing from requirements.txt"
+            $PIP install -r requirements.txt
+          elif [ -f "pyproject.toml" ]; then
+            echo "Installing from pyproject.toml (PEP 517)"
+            # Si build-backend, installe en mode dev/standard
+            $PIP install .
+          else
+            echo "⚠️   Aucun fichier de requirements trouvé. Tentative d’install minimale..."
+            # Option de secours : rien à faire
+          fi
+
+          # logs rapides
+          $PY -c "import sys; print(sys.version)"
+          $PY -c "import pkgutil; print('pkgs:', len(list(pkgutil.iter_modules())))"
+
+      # 4) Déterminer le point d’entrée (main.py ou équivalent)
+      - name: Locate project entrypoint
         id: locate
         shell: bash
-        env:
-          HOME: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          # Le repo projet cloné par l'installer s'appelle en général FunGen ; fallback sur un main.py
-          PROJ=""
-          if [ -d "${{ github.workspace }}/FunGen" ]; then
-            PROJ="${{ github.workspace }}/FunGen"
+          # Cherche un main.py dans le repo
+          PROJ_DIR="${{ github.workspace }}"
+          if [ -f "${PROJ_DIR}/main.py" ]; then
+            ENTRY="${PROJ_DIR}/main.py"
           else
-            PROJ="$(find "${{ github.workspace }}" -maxdepth 3 -type f -name main.py -print -quit | xargs -I{} dirname {} || true)"
+            ENTRY="$(find "${PROJ_DIR}" -maxdepth 3 -type f -name main.py -print -quit || true)"
           fi
-          if [ -z "${PROJ:-}" ] || [ ! -f "$PROJ/main.py" ]; then
-            echo "❌ main.py introuvable"; exit 1
-          fi
-
-          ENV_PATH="${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}"
-          if [ ! -x "$ENV_PATH/bin/python" ]; then
-            echo "❌ Python de l'env conda introuvable: $ENV_PATH/bin/python"
-            ls -la "$ENV_PATH" || true
+          if [ -z "${ENTRY:-}" ] || [ ! -f "$ENTRY" ]; then
+            echo "❌ main.py introuvable dans le repo. Adapte ce step si l'entrée est différente." >&2
             exit 1
           fi
+          echo "ENTRY=$ENTRY" >> $GITHUB_OUTPUT
+          echo "PROJ=$(dirname "$ENTRY")" >> $GITHUB_OUTPUT
+          echo "Found entry: $ENTRY"
 
-          echo "PROJ=$PROJ" >> $GITHUB_OUTPUT
-          echo "ENV_PATH=$ENV_PATH" >> $GITHUB_OUTPUT
-
-          "$ENV_PATH/bin/python" -V
-          "$ENV_PATH/bin/pip" -V
-
+      # 5) Créer le bundle .app
       - name: Create .app bundle layout
         shell: bash
         run: |
@@ -116,27 +129,28 @@ jobs:
           PLIST
           echo "APP_PATH=$APP" >> "$GITHUB_ENV"
 
-      - name: Embed Conda env + project + ffmpeg into the app
+      # 6) Embarquer env + projet + ffmpeg
+      - name: Embed conda env, project and ffmpeg into app
         shell: bash
         run: |
           set -euo pipefail
           APP="$APP_PATH"
+          ENV_PATH="${{ env.MINICONDA_DIR }}/envs/${{ env.ENV_NAME }}"
           PROJ="${{ steps.locate.outputs.PROJ }}"
-          ENV_PATH="${{ steps.locate.outputs.ENV_PATH }}"
 
-          # 1) Env conda complet (x86_64)
+          # Env conda complet
           rsync -a "$ENV_PATH/" "$APP/Contents/Resources/conda_env/"
 
-          # 2) Projet FunGen (sources)
+          # Code projet (repo courant)
           rsync -a --exclude '.git' "$PROJ/" "$APP/Contents/Resources/FunGen/"
 
-          # 3) ffmpeg/ffprobe (Homebrew) → Resources/bin
+          # ffmpeg/ffprobe → Resources/bin
           mkdir -p "$APP/Contents/Resources/bin"
           cp "$(brew --prefix)/bin/ffmpeg"  "$APP/Contents/Resources/bin/" || true
           cp "$(brew --prefix)/bin/ffprobe" "$APP/Contents/Resources/bin/" || true
           chmod +x "$APP/Contents/Resources/bin/"* || true
 
-          # 4) Lanceur (script) dans MacOS/
+          # Launcher
           cat > "$APP/Contents/MacOS/FunGen" <<'LAUNCH'
           #!/bin/bash
           set -e
@@ -154,6 +168,7 @@ jobs:
           LAUNCH
           chmod +x "$APP/Contents/MacOS/FunGen"
 
+      # 7) Smoke test
       - name: Smoke test (CLI)
         shell: bash
         run: |
@@ -161,6 +176,7 @@ jobs:
           "$APP_PATH/Contents/MacOS/FunGen" --help || true
           "$APP_PATH/Contents/MacOS/FunGen" -c "import sys,subprocess;print(sys.version);subprocess.run(['ffmpeg','-version'])" || true
 
+      # 8) Zip + artifact
       - name: Zip the app
         run: |
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "FunGen-macOS-Intel.zip"
