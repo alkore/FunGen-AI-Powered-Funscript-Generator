@@ -1,0 +1,64 @@
+name: Build ffplay (macOS Intel)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ffplay:
+    runs-on: macos-15-intel
+    env:
+      PREFIX: /usr/local
+      BUILD_DIR: ${{ github.workspace }}/ffmpeg
+
+    steps:
+      - name: Checkout FFmpeg sources
+        run: |
+          git clone --depth=1 https://github.com/FFmpeg/FFmpeg.git "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          git rev-parse HEAD
+
+      - name: Install dependencies (SDL2, pkg-config, nasm)
+        run: |
+          brew update
+          brew install sdl2 pkg-config nasm
+
+      - name: Configure FFmpeg for ffplay only
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          set -euo pipefail
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-everything \
+            --enable-ffplay \
+            --enable-sdl2 \
+            --enable-avformat \
+            --enable-avcodec \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avfilter \
+            --enable-avdevice \
+            --enable-protocol=file \
+            --enable-decoder=h264,hevc,aac,mp3,opus,flac,vorbis \
+            --enable-demuxer=mov,matroska,mp3,ogg,flac,avi,mp4 \
+            --enable-filter=scale,aresample,volume \
+            --enable-parser=h264,hevc,aac,mpegaudio \
+            --enable-zlib
+
+      - name: Build ffplay only
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          make -j$(sysctl -n hw.logicalcpu) ffplay
+          ls -lh ffplay
+
+      - name: Test ffplay binary
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          ./ffplay -version || true
+          otool -L ./ffplay
+
+      - name: Upload ffplay artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffplay-macos-intel
+          path: ${{ env.BUILD_DIR }}/ffplay
+          retention-days: 14
